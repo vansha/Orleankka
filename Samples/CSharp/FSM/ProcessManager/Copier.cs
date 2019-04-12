@@ -186,6 +186,8 @@ namespace ProcessManager
 
         Task<object> Active(object message) => message switch
         {   
+            // whatever state we are currently in BecomeStacked will record it,	
+            // so we can switch back easily using Unbecome
             Suspend _ => BecomeStacked(Suspended),
             _ => TaskResult.Unhandled
         };
