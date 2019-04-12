@@ -13,6 +13,18 @@ namespace Orleankka
 
     public abstract class ActorGrain : Grain, IRemindable, IActor
     {
+        protected static async Task<object> Do(Func<Task> t)
+        {
+            await t();
+            return Done;
+        }
+
+        protected static Task<object> Do(Action t)
+        {
+            t();
+            return TaskResult.Done;
+        }
+
         public static readonly Done Done = Done.Result;
         public static readonly Unhandled Unhandled = Unhandled.Result;
 

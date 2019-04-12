@@ -122,28 +122,24 @@ namespace ProcessManager
 
         public override async Task<object> Receive(object message)
         {
-            switch (message)
+            if (message is Activate _)
             {
-                case Activate _:
-                {
-                    // state is automatically loaded by storage provider
-                    // before Activate message is sent to the actor
-                    var state = State.Current ?? nameof(Initial); 
-                    behavior.Initial(state);
+                // state is automatically loaded by storage provider
+                // before Activate message is sent to the actor
+                var state = State.Current ?? nameof(Initial);
+                behavior.Initial(state);
 
-                    // grab reference to notifications stream
-                    notifications = System.StreamOf("notifications", "copier");
-                    break;
-                }
+                // grab reference to notifications stream
+                notifications = System.StreamOf("notifications", "copier");
             }
 
             // route all received messages via behavior
             return await behavior.Receive(message);
         }
 
-        async Task Become(Receive other) => await Switch(() => behavior.Become(other));
-        async Task BecomeStacked(Receive other) => await Switch(() => behavior.BecomeStacked(other));
-        async Task Unbecome() => await Switch(() => behavior.Unbecome());
+        Task<object> Become(Receive other) => Do(()=> Switch(() => behavior.Become(other)));
+        Task<object> BecomeStacked(Receive other) => Do(()=> Switch(() => behavior.BecomeStacked(other)));
+        Task<object> Unbecome() => Do(() => Switch(() => behavior.Unbecome()));
 
         async Task Switch(Func<Task> func)
         {
@@ -188,67 +184,42 @@ namespace ProcessManager
 
         static Task<object> Inactive(object message) => TaskResult.Unhandled;
 
-        async Task<object> Active(object message)
+        Task<object> Active(object message) => message switch
+        {   
+            Suspend _ => BecomeStacked(Suspended),
+            _ => TaskResult.Unhandled
+        };
+
+        Receive Durable(Receive next) => async message =>
         {
-            switch (message)
+            var result = await next(message);
+            if (message is Become)
             {
-                case Suspend _:
-                    // whatever state we are currently in BecomeStacked will record it,
-                    // so we can switch back easily using Unbecome
-                    await BecomeStacked(Suspended);
-                    break;
-                default: 
-                    return Unhandled;
+                State.Current = behavior.Current;
+                State.Previous = behavior.Previous;
+                await storage.WriteStateAsync();
             }
+            return result;
+        };
 
-            return Done;
-        }
-
-        Receive Durable(Receive next)
+        Task<object> Initial(object message) => message switch
         {
-            return async message =>
+            Start _ => Become(Preparing),
+            _ => TaskResult.Unhandled
+        };
+
+        Task<object> Preparing(object message)
+        {
+            return message switch
             {
-                var result = await next(message);
-                if (message is Become)
+                Activate _ => Do(() => RunJob(Prepare)),
+                Prepared x => Do(async () =>
                 {
-                    State.Current = behavior.Current;
-                    State.Previous = behavior.Previous;
-                    await storage.WriteStateAsync();
-                }
-                return result;
-            };
-        }
-
-        async Task<object> Initial(object message)
-        {
-            switch (message)
-            {
-                case Start _:
-                    await Become(Preparing);
-                    break;
-                default: 
-                    return Unhandled;
-            }
-
-            return Done;
-        }
-
-        async Task<object> Preparing(object message)
-        {
-            switch (message)
-            {
-                case Activate _:
-                    RunJob(Prepare);
-                    break;
-                case Prepared x:
                     State.LineTotal = x.Lines;
                     await Become(Copying);
-                    break;
-                default:
-                    return Unhandled;
-            }
-
-            return Done;
+                }),
+                _ => TaskResult.Unhandled
+            };
 
             async Task Prepare(BackgroundJobToken _)
             {
@@ -272,32 +243,28 @@ namespace ProcessManager
         string SourceFileName() => IOPath.Combine(IOPath.GetTempPath(), "orleankka_durable_fsm_example", $"{Id}.txt");
         string TargetFileName() => IOPath.Combine(IOPath.GetTempPath(), "orleankka_durable_fsm_example", $"{Id}-copy.txt");
 
-        async Task<object> Copying(object message)
+        Task<object> Copying(object message)
         {
             const int maxChunkSize = 500;
 
-            switch (message)
+            return message switch
             {
-                case Activate _:
-                    RunJob(Copy);
-                    break;
-                case Deactivate _:
-                    TerminateJob(Copy);
-                    break;
-                case Copied x:
+                Activate _      => Do(() => RunJob(Copy)),
+                Deactivate _    => Do(() => TerminateJob(Copy)),
+                Copied x        => Do(async () =>
+                {
                     State.LastCopiedLine += x.Count;
                     await storage.WriteStateAsync(); // checkpoint
+                    
                     // notify progress
-                    await NotifyProgressChanged((double)State.LastCopiedLine / State.LineTotal);
+                    await NotifyProgressChanged((double) State.LastCopiedLine / State.LineTotal);
+                    
                     // are we done?
                     if (x.Count < maxChunkSize)
                         await Become(Completed);
-                    break;
-                default:
-                    return Unhandled;
-            }
-
-            return Done;
+                }),
+                _ => TaskResult.Unhandled
+            };
 
             async Task Copy(BackgroundJobToken job)
             {
@@ -340,19 +307,11 @@ namespace ProcessManager
             async Task NotifyProgressChanged(double progress) => await Notify(new ProgressChanged {Progress = progress});
         }
 
-        async Task<object> Restartable(object message)
+        Task<object> Restartable(object message) => message switch
         {
-            switch (message)
-            {
-                case Restart _:
-                    await Become(Restarting); // switch to intermediary state
-                    break;
-                default: 
-                    return Unhandled;
-            }
-            
-            return Done;
-        }
+            Restart _ => Become(Restarting), // switch to intermediary state
+            _ =>  TaskResult.Unhandled
+        };
 
         async Task<object> Restarting(object message)
         {
@@ -379,33 +338,17 @@ namespace ProcessManager
             return Done;
         }
  
-        async Task<object> Suspended(object message)
+        Task<object> Suspended(object message) => message switch
         {
-            switch (message)
-            {
-                case Continue _:
-                    await Unbecome();
-                    break;
-                default: 
-                    return Unhandled;
-            }
-
-            return Done;
-        }
-
-        async Task<object> Cancellable(object message)
+            Continue _ => Unbecome(),
+            _ => TaskResult.Unhandled
+        };
+        
+        Task<object> Cancellable(object message) => message switch
         {
-            switch (message)
-            {
-                case Cancel _:
-                    await Become(Canceled);
-                    break;
-                default: 
-                    return Unhandled;
-            }
-
-            return Done;
-        }
+            Cancel _ => Become(Canceled),
+            _ => TaskResult.Unhandled
+        };
 
         static Task<object> Canceled(object message) => TaskResult.Unhandled;
         static Task<object> Completed(object message) => TaskResult.Unhandled;
