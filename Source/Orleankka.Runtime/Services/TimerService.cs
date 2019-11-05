@@ -154,11 +154,23 @@ namespace Orleankka.Services
 
         void ITimerService.Register(string id, TimeSpan due, Func<Task> callback)
         {
-            ((ITimerService) this).Register(id, due, TimeSpan.FromMilliseconds(1), async () =>
+            timers.Add(id, null);
+            
+            var timer = registry.RegisterTimer(grain, async s =>
             {
                 ((ITimerService) this).Unregister(id);
+                SetExecuting(id);
                 await callback();
-            });
+            }, 
+            null, due, period);
+            
+            if (!timers.TryGetValue(id, out var t))
+            {
+                timer.Dispose();
+                return;
+            }
+            
+            timers[id] = timer;
         }
 
         void ITimerService.Register(string id, TimeSpan due, TimeSpan period, Func<Task> callback)
@@ -194,7 +206,9 @@ namespace Orleankka.Services
         {
             var timer = timers[id];
             timers.Remove(id);
-            timer.Dispose();
+            
+            if (timer != null)
+                timer.Dispose();
         }
 
         bool ITimerService.IsRegistered(string id)
